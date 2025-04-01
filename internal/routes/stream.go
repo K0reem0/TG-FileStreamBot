@@ -15,34 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	chunkSize  = 10 * 1024 * 1024 // 10MB chunks
-	bufferSize = 32 * 1024        // 32KB buffer for copy operations
-)
-
-var (
-	log *zap.Logger
-	errContentLengthExceeded = fmt.Errorf("content length exceeded")
-)
-
-type contentLengthWriter struct {
-	http.ResponseWriter
-	remaining int64
-}
-
-func (w *contentLengthWriter) Write(p []byte) (int, error) {
-	if w.remaining <= 0 {
-		return 0, errContentLengthExceeded
-	}
-
-	if int64(len(p)) > w.remaining {
-		p = p[:w.remaining]
-	}
-
-	n, err := w.ResponseWriter.Write(p)
-	w.remaining -= int64(n)
-	return n, err
-}
+var log *zap.Logger
 
 func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
@@ -86,25 +59,12 @@ func getStreamRoute(ctx *gin.Context) {
 		return
 	}
 
-	// Generate ETag from file details
-	eTag := fmt.Sprintf(`"%x-%x"`, file.ID, file.FileSize)
-	ctx.Header("ETag", eTag)
-	
-	// Set caching headers (1 day cache)
-	ctx.Header("Cache-Control", "public, max-age=86400")
-	
-	// Check If-None-Match header
-	if match := r.Header.Get("If-None-Match"); match == eTag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
 	// for photo messages
 	if file.FileSize == 0 {
 		res, err := worker.Client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
 			Location: file.Location,
 			Offset:   0,
-			Limit:    chunkSize,
+			Limit:    1024 * 1024,
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -132,29 +92,21 @@ func getStreamRoute(ctx *gin.Context) {
 		end = file.FileSize - 1
 		w.WriteHeader(http.StatusOK)
 	} else {
-		ranges, err := range_parser.Parse(file.FileSize, rangeHeader)
+		ranges, err := range_parser.Parse(file.FileSize, r.Header.Get("Range"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		start = ranges[0].Start
 		end = ranges[0].End
-		
-		// Align range to chunk boundaries
-		start = (start / chunkSize) * chunkSize
-		if end-start > chunkSize {
-			end = start + chunkSize - 1
-		}
-		if end >= file.FileSize {
-			end = file.FileSize - 1
-		}
-		
 		ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
+		log.Info("Content-Range", zap.Int64("start", start), zap.Int64("end", end), zap.Int64("fileSize", file.FileSize))
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
 	contentLength := end - start + 1
 	mimeType := file.MimeType
+
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -163,36 +115,17 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Length", strconv.FormatInt(contentLength, 10))
 
 	disposition := "inline"
+
 	if ctx.Query("d") == "true" {
 		disposition = "attachment"
 	}
+
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
-		lr, err := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, chunkSize)
-		if err != nil {
-			log.Error("Error creating Telegram reader", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		cw := &contentLengthWriter{
-			ResponseWriter: w,
-			remaining:      contentLength,
-		}
-
-		buf := make([]byte, bufferSize)
-		if _, err := io.CopyBuffer(cw, lr, buf); err != nil {
-			if err != errContentLengthExceeded {
-				log.Error("Error while copying stream", zap.Error(err))
-			}
-		}
-
-		if cw.remaining > 0 {
-			log.Warn("File content shorter than declared",
-				zap.Int64("expected", contentLength),
-				zap.Int64("actual", contentLength-cw.remaining),
-			)
+		lr, _ := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, contentLength)
+		if _, err := io.CopyN(w, lr, contentLength); err != nil {
+			log.Error("Error while copying stream", zap.Error(err))
 		}
 	}
 }
