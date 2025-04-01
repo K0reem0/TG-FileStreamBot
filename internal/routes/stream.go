@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
