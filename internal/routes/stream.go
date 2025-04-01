@@ -123,9 +123,10 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
-		lr, _ := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, contentLength)
-		if _, err := io.CopyN(w, lr, contentLength); err != nil {
-			log.Error("Error while copying stream", zap.Error(err))
-		}
-	}
+    lr, _ := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, contentLength)
+    // Use a larger buffer (1MB instead of default 32KB) for faster streaming
+    buf := make([]byte, 1<<20) // 1MB buffer
+    if _, err := io.CopyBuffer(w, lr, buf); err != nil {
+        log.Error("Error while copying stream", zap.Error(err))
+    }
 }
