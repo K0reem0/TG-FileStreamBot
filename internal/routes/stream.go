@@ -16,11 +16,33 @@ import (
 )
 
 const (
-	chunkSize = 10 * 1024 * 1024 // 10MB chunks
-	bufferSize = 32 * 1024       // 32KB buffer for copy operations
+	chunkSize  = 10 * 1024 * 1024 // 10MB chunks
+	bufferSize = 32 * 1024        // 32KB buffer for copy operations
 )
 
-var log *zap.Logger
+var (
+	log *zap.Logger
+	errContentLengthExceeded = fmt.Errorf("content length exceeded")
+)
+
+type contentLengthWriter struct {
+	http.ResponseWriter
+	remaining int64
+}
+
+func (w *contentLengthWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errContentLengthExceeded
+	}
+
+	if int64(len(p)) > w.remaining {
+		p = p[:w.remaining]
+	}
+
+	n, err := w.ResponseWriter.Write(p)
+	w.remaining -= int64(n)
+	return n, err
+}
 
 func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
@@ -82,7 +104,7 @@ func getStreamRoute(ctx *gin.Context) {
 		res, err := worker.Client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
 			Location: file.Location,
 			Offset:   0,
-			Limit:    chunkSize, // Use the larger chunk size
+			Limit:    chunkSize,
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -118,7 +140,7 @@ func getStreamRoute(ctx *gin.Context) {
 		start = ranges[0].Start
 		end = ranges[0].End
 		
-		// Ensure the range is aligned to chunk boundaries for better caching
+		// Align range to chunk boundaries
 		start = (start / chunkSize) * chunkSize
 		if end-start > chunkSize {
 			end = start + chunkSize - 1
@@ -128,13 +150,11 @@ func getStreamRoute(ctx *gin.Context) {
 		}
 		
 		ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
-		log.Info("Content-Range", zap.Int64("start", start), zap.Int64("end", end), zap.Int64("fileSize", file.FileSize))
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
 	contentLength := end - start + 1
 	mimeType := file.MimeType
-
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -149,10 +169,30 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
-		lr, _ := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, chunkSize) // Pass chunkSize
+		lr, err := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, chunkSize)
+		if err != nil {
+			log.Error("Error creating Telegram reader", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		cw := &contentLengthWriter{
+			ResponseWriter: w,
+			remaining:      contentLength,
+		}
+
 		buf := make([]byte, bufferSize)
-		if _, err := io.CopyBuffer(w, lr, buf); err != nil {
-			log.Error("Error while copying stream", zap.Error(err))
+		if _, err := io.CopyBuffer(cw, lr, buf); err != nil {
+			if err != errContentLengthExceeded {
+				log.Error("Error while copying stream", zap.Error(err))
+			}
+		}
+
+		if cw.remaining > 0 {
+			log.Warn("File content shorter than declared",
+				zap.Int64("expected", contentLength),
+				zap.Int64("actual", contentLength-cw.remaining),
+			)
 		}
 	}
 }
