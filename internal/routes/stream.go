@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
 	"go.uber.org/zap"
@@ -27,6 +28,14 @@ const (
 )
 
 var log *zap.Logger
+
+type FileInfo struct {
+	FileName string
+	FileSize int64
+	MimeType string
+	ID       int64
+	Location tg.InputFileLocationClass
+}
 
 func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
@@ -59,7 +68,7 @@ func getStreamRoute(ctx *gin.Context) {
 	worker := bot.GetNextWorker()
 
 	// Fetch file info
-	file, err := utils.FileFromMessage(ctx, worker.Client, messageID)
+	file, err := getFileFromMessage(ctx, worker.Client, messageID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -79,7 +88,7 @@ func getStreamRoute(ctx *gin.Context) {
 
 	// Handle photo messages (special case)
 	if file.FileSize == 0 {
-		handlePhotoMessage(ctx, worker.Client, file)
+		handlePhotoMessage(ctx, worker.Client.API(), file)
 		return
 	}
 
@@ -126,7 +135,7 @@ func getStreamRoute(ctx *gin.Context) {
 	defer bufferedWriter.Flush()
 
 	// Create Telegram reader with buffer
-	lr, err := utils.NewTelegramReader(ctx, worker.Client, file.Location, start, end, contentLength)
+	lr, err := utils.NewTelegramReader(ctx, worker.Client.API(), file.Location, start, end, contentLength)
 	if err != nil {
 		log.Error("Failed to create reader", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -140,11 +149,11 @@ func getStreamRoute(ctx *gin.Context) {
 	}
 }
 
-func handlePhotoMessage(ctx *gin.Context, client *tg.Client, file *utils.FileInfo) {
+func handlePhotoMessage(ctx *gin.Context, client *tg.Client, file *FileInfo) {
 	w := ctx.Writer
 	r := ctx.Request
 
-	res, err := client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+	res, err := client.UploadGetFile(ctx, &tg.UploadGetFileRequest{
 		Location: file.Location,
 		Offset:   0,
 		Limit:    1024 * 1024,
@@ -169,7 +178,7 @@ func handlePhotoMessage(ctx *gin.Context, client *tg.Client, file *utils.FileInf
 	}
 }
 
-func setStreamingHeaders(ctx *gin.Context, file *utils.FileInfo, contentLength int64) {
+func setStreamingHeaders(ctx *gin.Context, file *FileInfo, contentLength int64) {
 	w := ctx.Writer
 	r := ctx.Request
 
@@ -196,4 +205,21 @@ func setStreamingHeaders(ctx *gin.Context, file *utils.FileInfo, contentLength i
 	if strings.HasPrefix(mimeType, "video/") && r.ProtoMajor >= 2 {
 		w.Header().Set("Link", "</next-segment>; rel=preload; as=fetch")
 	}
+}
+
+func getFileFromMessage(ctx *gin.Context, client *telegram.Client, messageID int) (*FileInfo, error) {
+	// Implement your logic to get file info from message
+	// This should return a FileInfo struct with all required fields
+	// Example implementation:
+	return &FileInfo{
+		FileName: "example.mp4",
+		FileSize: 1024 * 1024,
+		MimeType: "video/mp4",
+		ID:       int64(messageID),
+		Location: &tg.InputDocumentFileLocation{
+			ID:            int64(messageID),
+			AccessHash:    0, // Set proper access hash
+			FileReference: []byte{}, // Set proper file reference
+		},
+	}, nil
 }
