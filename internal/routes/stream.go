@@ -129,4 +129,5 @@ func getStreamRoute(ctx *gin.Context) {
     if _, err := io.CopyBuffer(w, lr, buf); err != nil {
         log.Error("Error while copying stream", zap.Error(err))
     }
+  }
 }
