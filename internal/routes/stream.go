@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gotd/td/telegram"
+	"github.com/anonyindian/gotgproto/client"
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
 	"go.uber.org/zap"
@@ -68,7 +68,7 @@ func getStreamRoute(ctx *gin.Context) {
 	worker := bot.GetNextWorker()
 
 	// Fetch file info
-	file, err := getFileFromMessage(ctx, worker.Client, messageID)
+	file, err := getFileFromMessage(ctx, worker, messageID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -135,7 +135,7 @@ func getStreamRoute(ctx *gin.Context) {
 	defer bufferedWriter.Flush()
 
 	// Create Telegram reader with buffer
-	lr, err := utils.NewTelegramReader(ctx, worker.Client.API(), file.Location, start, end, contentLength)
+	lr, err := utils.NewTelegramReader(ctx, worker, file.Location, start, end, contentLength)
 	if err != nil {
 		log.Error("Failed to create reader", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -207,8 +207,8 @@ func setStreamingHeaders(ctx *gin.Context, file *FileInfo, contentLength int64) 
 	}
 }
 
-func getFileFromMessage(ctx *gin.Context, client *telegram.Client, messageID int) (*FileInfo, error) {
-	// Implement your logic to get file info from message
+func getFileFromMessage(ctx *gin.Context, worker *client.Client, messageID int) (*FileInfo, error) {
+	// Implement your actual logic to get file info from message
 	// This should return a FileInfo struct with all required fields
 	// Example implementation:
 	return &FileInfo{
