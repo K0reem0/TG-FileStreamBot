@@ -1,17 +1,18 @@
 package routes
 
 import (
+	"bytes"
+	"compress/gzip"
 	"EverythingSuckz/fsb/internal/bot"
 	"EverythingSuckz/fsb/internal/utils"
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/anonyindian/gotgproto/client"
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
 	"go.uber.org/zap"
@@ -19,27 +20,92 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	chunkSize       = 1 * 1024 * 1024 // 1MB chunks for better throughput
-	preloadSize     = 5 * 1024 * 1024 // Preload first 5MB for faster start
-	maxCacheAge     = 24 * time.Hour   // Cache control max age
-	readBufferSize  = 512 * 1024       // 512KB read buffer
-	writeBufferSize = 512 * 1024       // 512KB write buffer
+var (
+	log          *zap.Logger
+	clientPool   = make(chan *tg.Client, 10) // Connection pool
+	poolInitOnce sync.Once
 )
 
-var log *zap.Logger
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
 
-type FileInfo struct {
-	FileName string
-	FileSize int64
-	MimeType string
-	ID       int64
-	Location tg.InputFileLocationClass
+func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+type bufferedTelegramReader struct {
+	ctx       *gin.Context
+	client    *tg.Client
+	location  tg.InputFileLocationClass
+	offset    int64
+	fileSize  int64
+	buffer    *bytes.Buffer
+	chunkSize int64
+	current   int64
+}
+
+func newBufferedTelegramReader(ctx *gin.Context, client *tg.Client, location tg.InputFileLocationClass, offset, length, chunkSize int64) *bufferedTelegramReader {
+	return &bufferedTelegramReader{
+		ctx:       ctx,
+		client:    client,
+		location:  location,
+		offset:    offset,
+		fileSize:  offset + length,
+		buffer:    bytes.NewBuffer(make([]byte, 0, chunkSize)),
+		chunkSize: chunkSize,
+		current:   offset,
+	}
+}
+
+func (b *bufferedTelegramReader) Read(p []byte) (n int, err error) {
+	if b.buffer.Len() == 0 {
+		if b.current >= b.fileSize {
+			return 0, io.EOF
+		}
+
+		end := b.current + b.chunkSize
+		if end > b.fileSize {
+			end = b.fileSize
+		}
+
+		res, err := b.client.API().UploadGetFile(b.ctx, &tg.UploadGetFileRequest{
+			Location: b.location,
+			Offset:   b.current,
+			Limit:    int(end - b.current),
+		})
+		if err != nil {
+			return 0, err
+		}
+
+		result, ok := res.(*tg.UploadFile)
+		if !ok {
+			return 0, fmt.Errorf("unexpected response type")
+		}
+
+		b.buffer.Reset()
+		if _, err := b.buffer.Write(result.GetBytes()); err != nil {
+			return 0, err
+		}
+
+		b.current = end
+	}
+
+	return b.buffer.Read(p)
 }
 
 func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
-	defer log.Info("Loaded optimized stream route")
+	defer log.Info("Loaded stream route")
+	
+	// Initialize client pool
+	poolInitOnce.Do(func() {
+		for i := 0; i < cap(clientPool); i++ {
+			clientPool <- bot.GetNextWorker().Client
+		}
+	})
+	
 	r.Engine.GET("/stream/:messageID", getStreamRoute)
 }
 
@@ -47,34 +113,32 @@ func getStreamRoute(ctx *gin.Context) {
 	w := ctx.Writer
 	r := ctx.Request
 
-	// Enable HTTP/2 push and buffering
-	w.Header().Set("X-Accel-Buffering", "yes")
-
-	// Parse message ID
+	// Get message ID
 	messageID, err := strconv.Atoi(ctx.Param("messageID"))
 	if err != nil {
-		http.Error(w, "Invalid message ID", http.StatusBadRequest)
+		http.Error(w, "invalid message ID", http.StatusBadRequest)
 		return
 	}
 
-	// Validate auth hash
+	// Validate hash
 	authHash := ctx.Query("hash")
 	if authHash == "" {
-		http.Error(w, "Missing hash parameter", http.StatusBadRequest)
+		http.Error(w, "missing hash param", http.StatusBadRequest)
 		return
 	}
 
-	// Get Telegram worker
-	worker := bot.GetNextWorker()
+	// Get client from pool
+	client := <-clientPool
+	defer func() { clientPool <- client }()
 
-	// Fetch file info
-	file, err := getFileFromMessage(ctx, worker, messageID)
+	// Get file info
+	file, err := utils.FileFromMessage(ctx, client, messageID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Verify hash
+	// Validate hash
 	expectedHash := utils.PackFile(
 		file.FileName,
 		file.FileSize,
@@ -82,144 +146,135 @@ func getStreamRoute(ctx *gin.Context) {
 		file.ID,
 	)
 	if !utils.CheckHash(authHash, expectedHash) {
-		http.Error(w, "Invalid hash", http.StatusBadRequest)
+		http.Error(w, "invalid hash", http.StatusBadRequest)
 		return
 	}
 
-	// Handle photo messages (special case)
+	// Handle photo messages
 	if file.FileSize == 0 {
-		handlePhotoMessage(ctx, worker.Client.API(), file)
+		res, err := client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+			Location: file.Location,
+			Offset:   0,
+			Limit:    1024 * 1024,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result, ok := res.(*tg.UploadFile)
+		if !ok {
+			http.Error(w, "unexpected response", http.StatusInternalServerError)
+			return
+		}
+		fileBytes := result.GetBytes()
+		ctx.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", file.FileName))
+		if r.Method != "HEAD" {
+			ctx.Data(http.StatusOK, file.MimeType, fileBytes)
+		}
 		return
 	}
 
-	// Parse range header
+	// Handle range requests
 	var start, end int64
 	rangeHeader := r.Header.Get("Range")
 
 	if rangeHeader == "" {
-		// Full file request
 		start = 0
 		end = file.FileSize - 1
 		w.WriteHeader(http.StatusOK)
 	} else {
-		// Partial content request
 		ranges, err := range_parser.Parse(file.FileSize, rangeHeader)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if len(ranges) > 1 {
+			http.Error(w, "multipart ranges not supported", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
 		start = ranges[0].Start
 		end = ranges[0].End
-		
-		// Preload optimization - limit initial request size
-		if end-start > preloadSize {
-			end = start + preloadSize - 1
+		if end >= file.FileSize {
+			end = file.FileSize - 1
 		}
-		
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
+		ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
 	contentLength := end - start + 1
-
-	// Set headers for optimal streaming
-	setStreamingHeaders(ctx, file, contentLength)
-
-	// Skip body for HEAD requests
-	if r.Method == "HEAD" {
-		return
-	}
-
-	// Create buffered reader and writer
-	bufferedWriter := bufio.NewWriterSize(w, writeBufferSize)
-	defer bufferedWriter.Flush()
-
-	// Create Telegram reader with buffer
-	lr, err := utils.NewTelegramReader(ctx, worker, file.Location, start, end, contentLength)
-	if err != nil {
-		log.Error("Failed to create reader", zap.Error(err))
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	bufferedReader := bufio.NewReaderSize(lr, readBufferSize)
-
-	// Stream with large buffer
-	if _, err := io.CopyN(bufferedWriter, bufferedReader, contentLength); err != nil {
-		log.Error("Streaming error", zap.Error(err))
-	}
-}
-
-func handlePhotoMessage(ctx *gin.Context, client *tg.Client, file *FileInfo) {
-	w := ctx.Writer
-	r := ctx.Request
-
-	res, err := client.UploadGetFile(ctx, &tg.UploadGetFileRequest{
-		Location: file.Location,
-		Offset:   0,
-		Limit:    1024 * 1024,
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	result, ok := res.(*tg.UploadFile)
-	if !ok {
-		http.Error(w, "Unexpected response", http.StatusInternalServerError)
-		return
-	}
-
-	fileBytes := result.GetBytes()
-	ctx.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", file.FileName))
-	ctx.Header("Cache-Control", fmt.Sprintf("public, max-age=%d", int(maxCacheAge.Seconds())))
-
-	if r.Method != "HEAD" {
-		ctx.Data(http.StatusOK, file.MimeType, fileBytes)
-	}
-}
-
-func setStreamingHeaders(ctx *gin.Context, file *FileInfo, contentLength int64) {
-	w := ctx.Writer
-	r := ctx.Request
-
-	// Common headers
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(maxCacheAge.Seconds())))
-
-	// Content-Type
 	mimeType := file.MimeType
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-	w.Header().Set("Content-Type", mimeType)
+
+	// Set headers
+	ctx.Header("Accept-Ranges", "bytes")
+	ctx.Header("Content-Type", mimeType)
+	ctx.Header("Content-Length", strconv.FormatInt(contentLength, 10))
+	ctx.Header("Cache-Control", "public, max-age=31536000, immutable")
+	ctx.Header("ETag", expectedHash)
 
 	// Content-Disposition
 	disposition := "inline"
 	if ctx.Query("d") == "true" {
 		disposition = "attachment"
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
+	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
-	// HTTP/2 Push for known video formats
-	if strings.HasPrefix(mimeType, "video/") && r.ProtoMajor >= 2 {
-		w.Header().Set("Link", "</next-segment>; rel=preload; as=fetch")
+	// Video-specific optimizations
+	if strings.HasPrefix(mimeType, "video/") {
+		ctx.Header("X-Content-Type-Options", "nosniff")
+		if rangeHeader == "" {
+			ctx.Header("Content-Type", "video/mp4")
+		}
 	}
-}
 
-func getFileFromMessage(ctx *gin.Context, worker *client.Client, messageID int) (*FileInfo, error) {
-	// Implement your actual logic to get file info from message
-	// This should return a FileInfo struct with all required fields
-	// Example implementation:
-	return &FileInfo{
-		FileName: "example.mp4",
-		FileSize: 1024 * 1024,
-		MimeType: "video/mp4",
-		ID:       int64(messageID),
-		Location: &tg.InputDocumentFileLocation{
-			ID:            int64(messageID),
-			AccessHash:    0, // Set proper access hash
-			FileReference: []byte{}, // Set proper file reference
-		},
-	}, nil
+	if r.Method == "HEAD" {
+		return
+	}
+
+	// Determine buffer size
+	bufferSize := int64(256 * 1024) // 256KB default
+	if strings.HasPrefix(mimeType, "video/") {
+		bufferSize = 1 * 1024 * 1024 // 1MB for videos
+	}
+
+	// Create reader
+	reader := newBufferedTelegramReader(ctx, client, file.Location, start, contentLength, bufferSize)
+
+	// Special handling for video streaming
+	if strings.HasPrefix(mimeType, "video/") {
+		flusher, ok := w.(http.Flusher)
+		if ok {
+			buf := make([]byte, bufferSize)
+			for {
+				n, err := reader.Read(buf)
+				if err != nil && err != io.EOF {
+					break
+				}
+				if n == 0 {
+					break
+				}
+				if _, err := w.Write(buf[:n]); err != nil {
+					break
+				}
+				flusher.Flush()
+			}
+			return
+		}
+	}
+
+	// Compress non-media files
+	if !strings.HasPrefix(mimeType, "video/") && 
+	   !strings.HasPrefix(mimeType, "audio/") && 
+	   !strings.HasPrefix(mimeType, "image/") {
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		w = gzipResponseWriter{Writer: gz, ResponseWriter: w}
+	}
+
+	// Stream content
+	if _, err := io.CopyN(w, reader, contentLength); err != nil {
+		log.Error("Error while copying stream", zap.Error(err))
+	}
 }
