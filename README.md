@@ -1,4 +1,4 @@
-<h1 align="center">Telegram File Stream Bot</h1>
+<h1 align="center">Telegram File Stream Bot.</h1>
 <p align="center">
   </a>
   <p align="center">
