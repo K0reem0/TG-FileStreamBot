@@ -11,10 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	range_parser "github.com/quantumsheep/range-parser"
+	"github.com/quantumsheep/range-parser"
 	"go.uber.org/zap"
 
 	"github.com/gin-gonic/gin"
@@ -22,22 +22,26 @@ import (
 
 var (
 	log          *zap.Logger
-	clientPool   = make(chan *tg.Client, 10) // Connection pool
+	clientPool   = make(chan *bot.Worker, 10) // Worker pool instead of raw client
 	poolInitOnce sync.Once
 )
 
 type gzipResponseWriter struct {
 	io.Writer
-	http.ResponseWriter
+	gin.ResponseWriter
 }
 
 func (w gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
 }
 
+func (w gzipResponseWriter) CloseNotify() <-chan bool {
+	return w.ResponseWriter.(http.CloseNotifier).CloseNotify()
+}
+
 type bufferedTelegramReader struct {
 	ctx       *gin.Context
-	client    *tg.Client
+	worker    *bot.Worker
 	location  tg.InputFileLocationClass
 	offset    int64
 	fileSize  int64
@@ -46,10 +50,10 @@ type bufferedTelegramReader struct {
 	current   int64
 }
 
-func newBufferedTelegramReader(ctx *gin.Context, client *tg.Client, location tg.InputFileLocationClass, offset, length, chunkSize int64) *bufferedTelegramReader {
+func newBufferedTelegramReader(ctx *gin.Context, worker *bot.Worker, location tg.InputFileLocationClass, offset, length, chunkSize int64) *bufferedTelegramReader {
 	return &bufferedTelegramReader{
 		ctx:       ctx,
-		client:    client,
+		worker:    worker,
 		location:  location,
 		offset:    offset,
 		fileSize:  offset + length,
@@ -70,7 +74,7 @@ func (b *bufferedTelegramReader) Read(p []byte) (n int, err error) {
 			end = b.fileSize
 		}
 
-		res, err := b.client.API().UploadGetFile(b.ctx, &tg.UploadGetFileRequest{
+		res, err := b.worker.Client.API().UploadGetFile(b.ctx, &tg.UploadGetFileRequest{
 			Location: b.location,
 			Offset:   b.current,
 			Limit:    int(end - b.current),
@@ -99,10 +103,10 @@ func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
 	defer log.Info("Loaded stream route")
 	
-	// Initialize client pool
+	// Initialize worker pool
 	poolInitOnce.Do(func() {
 		for i := 0; i < cap(clientPool); i++ {
-			clientPool <- bot.GetNextWorker().Client
+			clientPool <- bot.GetNextWorker()
 		}
 	})
 	
@@ -127,12 +131,12 @@ func getStreamRoute(ctx *gin.Context) {
 		return
 	}
 
-	// Get client from pool
-	client := <-clientPool
-	defer func() { clientPool <- client }()
+	// Get worker from pool
+	worker := <-clientPool
+	defer func() { clientPool <- worker }()
 
 	// Get file info
-	file, err := utils.FileFromMessage(ctx, client, messageID)
+	file, err := utils.FileFromMessage(ctx, worker, messageID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -152,7 +156,7 @@ func getStreamRoute(ctx *gin.Context) {
 
 	// Handle photo messages
 	if file.FileSize == 0 {
-		res, err := client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+		res, err := worker.Client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
 			Location: file.Location,
 			Offset:   0,
 			Limit:    1024 * 1024,
@@ -240,7 +244,7 @@ func getStreamRoute(ctx *gin.Context) {
 	}
 
 	// Create reader
-	reader := newBufferedTelegramReader(ctx, client, file.Location, start, contentLength, bufferSize)
+	reader := newBufferedTelegramReader(ctx, worker, file.Location, start, contentLength, bufferSize)
 
 	// Special handling for video streaming
 	if strings.HasPrefix(mimeType, "video/") {
